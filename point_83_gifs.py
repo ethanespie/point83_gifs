@@ -6,27 +6,206 @@ import requests
 import bs4
 
 
-# TODO: make it so that log file goes in same folder as output (neater/cleaner)
-# TODO: more/better exception handling, and other pylint-noted stuff
-# TODO: get rid of global vars as much as possible
-# TODO: improve at least some of the regex logic
-# TODO: unit tests
-# TODO: implement class(es)
-
-
 START_TIME = datetime.now()
-FOLDER_AND_LOG_NAME = "Point83GIFs_" + "{:04d}".format(START_TIME.year) + "_" + \
-                      "{:02d}".format(START_TIME.month) + "_" + \
-                      "{:02d}".format(START_TIME.day) + "_" + \
-                      "{:02d}".format(START_TIME.hour) + \
-                      "{:02d}".format(START_TIME.minute)
-MAX_GIFS_PER_FORUM_PAGE = 100   # max gifs per page; sometimes kept low just for debugging purposes
+FOLDER_AND_LOG_NAME = f"Point83GIFs_{START_TIME.strftime('%Y%m%d_%H%M')}"
 
-FORUM_PAGE_NUM = 0              # actual forum page number
-ALL_SAVED_GIF_PATHS = []        # paths to GIFs downloaded, with "http" or "https" removed
-ALL_FILE_NAMES_SAVED = []       # names of files saved (start with name of thread where first found)
+MAX_GIFS_PER_FORUM_PAGE = (
+    100  # max gifs per page; sometimes kept low just for debugging purposes
+)
+
+FORUM_PAGE_NUM = 0  # actual forum page number
+ALL_SAVED_GIF_PATHS = []  # paths to GIFs downloaded, with "http" or "https" removed
+ALL_FILE_NAMES_SAVED = (
+    []
+)  # names of files saved (start with name of thread where first found)
 TOTAL_GIFS_DOWNLOADED = 0
-TOTAL_THREAD_PAGES_SCRAPED = 0
+TOTAL_THREAD_PGS_SCRAPED = 0
+
+
+class Forum:
+    def __init__(self, resp, max_forum_pgs_to_process) -> None:
+        self.resp = resp
+        self.max_forum_pgs_to_process = max_forum_pgs_to_process
+
+    def process_forum(self):
+
+        global FORUM_PAGE_NUM  # TEMP
+        page_num = 1  # TEMP
+
+        forum_next_button = True
+        while forum_next_button:
+            soup = bs4.BeautifulSoup(self.resp.text, "html.parser")
+            viewtopic_anchors = soup.find_all("span", class_="blacklink")
+            # forum_next_btn_anchors = soup.find_all("a", href=True, text="Next")
+            forum_next_btn_anchors = soup.find_all("a", href=True, string="Next")
+
+            write_to_log_and_or_console(
+                f"------------------------\nFORUM PAGE {str(FORUM_PAGE_NUM)}"
+            )
+            write_to_log_and_or_console("------------------------\n")
+
+            all_uris = []  # "viewtopic" part of URL of thread
+            all_thread_names = []  # actual thread names
+            for anchor in viewtopic_anchors:
+                if str(anchor).find("viewtopic.php?t") != -1:
+                    all_uris.append(
+                        str(anchor)[
+                            str(anchor).find("viewtopic") : str(anchor).find("&")
+                        ]
+                    )
+                    all_thread_names.append(anchor.text)
+
+            for i in range(len(all_uris)):
+                thread = Thread(all_uris[i], all_thread_names[i])
+                thread.process_thread()
+
+            # go to next page (IF there is one)
+            if len(forum_next_btn_anchors) > 0:
+                url = f"http://www.point83.com/forum/{forum_next_btn_anchors[0].get('href')}"
+                try:
+                    self.resp = requests.get(url)
+                    self.resp.raise_for_status()
+                except requests.exceptions.RequestException:
+                    write_to_log_and_or_console(
+                        f"\n\nERROR:  URL for forum page number "
+                        f"{str(FORUM_PAGE_NUM + 1)} ({url}) "
+                        f"could not be located."
+                    )
+                    write_to_log_and_or_console("Exiting process.\n\n")
+                    return
+                page_num += 1
+                FORUM_PAGE_NUM += 1
+            else:
+                forum_next_button = False
+
+            if page_num > self.max_forum_pgs_to_process:
+                forum_next_button = False
+
+
+class Thread:
+
+    def __init__(self, uri, thread_name):
+        self.uri = uri
+        self.thread_name = thread_name
+
+    def process_thread(self):
+        global TOTAL_THREAD_PGS_SCRAPED
+        # remove all non-ascii characters:
+        thread_name_for_log = re.sub(r"[^\x00-\x7f]", r"", self.thread_name).strip()
+
+        # remove characters which aren't alpha/num/dot/underscore
+        thread_name_for_file_names = re.sub(
+            "[^0-9a-zA-Z._]", "", self.thread_name
+        ).strip()
+
+        thread_page_num = 0
+        thread_next_button = True
+        while thread_next_button:
+            url = f"http://www.point83.com/forum/{self.uri}"
+            try:
+                res = requests.get(url)
+                res.raise_for_status()
+            except requests.exceptions.RequestException:
+                write_to_log_and_or_console(
+                    f'ERROR:  URL for thread "{thread_name_for_log}'
+                    f'"\n({url}) could not be located.'
+                )
+                write_to_log_and_or_console("Moving to next thread.\n")
+                return
+            soup = bs4.BeautifulSoup(res.text, "html.parser")
+            # thread_next_btn_anchors = soup.find_all("a", href=True, text="Next")
+            thread_next_btn_anchors = soup.find_all("a", href=True, string="Next")
+
+            if len(thread_next_btn_anchors) > 0 or thread_page_num > 0:
+                # (if it's a MULTI-page thread ... note, second part of the above if
+                #  statement is needed for the *last* page of the multi-page thread)
+                thread_page_num += 1
+                write_to_log_and_or_console(
+                    f'Searching for GIFs in "{thread_name_for_log}'
+                    f'" PAGE {str(thread_page_num)} .......'
+                )
+                final_thread_name = (
+                    thread_name_for_file_names + "_PG" + str(thread_page_num)
+                )
+                # (if it's the LAST page of multi-pg thread)
+                if len(thread_next_btn_anchors) == 0:
+                    thread_next_button = False
+            else:
+                # (if it's a SINGLE-page thread)
+                write_to_log_and_or_console(
+                    f'Searching for GIFs in "{thread_name_for_log}' f'" .......'
+                )
+                final_thread_name = thread_name_for_file_names
+                thread_next_button = False
+
+            # download all GIFs for this page
+            page = Page(soup, final_thread_name)
+            page.process_page()
+
+            TOTAL_THREAD_PGS_SCRAPED += 1
+
+            # if there are "Next" buttons, go to next page in thread
+            if len(thread_next_btn_anchors) > 0:
+                self.uri = thread_next_btn_anchors[0].get("href")
+
+
+class Page:
+    def __init__(self, soup, thread_name_for_file_names):
+        self.soup = soup
+        self.thread_name_for_file_names = thread_name_for_file_names
+        self.gifs_downloaded = 0
+        self.failed_downloads = []
+
+    def process_page(self):
+        global TOTAL_GIFS_DOWNLOADED
+        gifs = self.soup.find_all("img", src=re.compile(r"\.gif$"))
+
+        for gif in gifs:
+            if str(gif).find('src="http') != -1:
+                if not self._download_gif(gif):
+                    continue
+
+        write_to_log_and_or_console(f"\t{str(self.gifs_downloaded)} GIFs downloaded\n")
+
+    def _download_gif(self, gif):
+        global TOTAL_GIFS_DOWNLOADED
+
+        try:
+            img_file = gif.get("src")
+            file_rsrc = requests.get(img_file)
+            file_rsrc.raise_for_status()
+        except requests.exceptions.RequestException:
+            if gif.get("src") not in self.failed_downloads:
+                write_to_log_and_or_console(
+                    f"ERROR:  {gif.get('src')} had a problem downloading!"
+                )
+            self.failed_downloads.append(str(gif.get("src")))
+            # (w/o that "if" ^^ and the failed_downloads list:  was writing to log
+            # multiple times for a given failed GIF on a given page)
+            return False
+
+        # (w/o that "if" ^^ and the failed_downloads list:  was writing to log
+        # multiple times for a given failed GIF on a given page)
+        img_file = img_file.replace("http://", "")
+        img_file = img_file.replace("https://", "")
+        # if GIF isn't already in the list of all saved GIFs.....
+        if img_file not in ALL_SAVED_GIF_PATHS:
+            if self.gifs_downloaded > MAX_GIFS_PER_FORUM_PAGE - 1:
+                write_to_log_and_or_console(
+                    f"\tMaximum ({str(MAX_GIFS_PER_FORUM_PAGE)}) GIFs "
+                    f"already downloaded for this page; moving to next "
+                    f"page or thread..."
+                )
+                return False
+
+            img_file_name = img_file
+            if save_file(self.thread_name_for_file_names, img_file_name, file_rsrc):
+                ALL_SAVED_GIF_PATHS.append(img_file)
+                self.gifs_downloaded += 1
+                TOTAL_GIFS_DOWNLOADED += 1
+                return True
+
+        return False
 
 
 def initial_setup():
@@ -42,24 +221,20 @@ def initial_setup():
         initial_url = initial_url + "&topicdays=0&start=" + str(index)
 
     try:
-        res = requests.get(initial_url)  # "downloads" the web page; returns a response object
+        res = requests.get(
+            initial_url
+        )  # "downloads" the web page; returns a response object
         res.raise_for_status()  # checks to see if download worked; raises exception if fail
     except requests.exceptions.RequestException as exception:
-        print("ERROR:  URL " + initial_url + " could not be located.\n")
+        print(f'ERROR:  URL "{initial_url}" could not be located.\n')
         print(exception)
         sys.exit()
-
-    # Delete log if already exists (only needed when script run/cancelled/rerun in same minute)
-    try:
-        os.remove(FOLDER_AND_LOG_NAME + ".txt")
-    except OSError:
-        pass
 
     # Make folder to store downloaded GIFs in
     try:
         os.makedirs(FOLDER_AND_LOG_NAME, exist_ok=True)
     except OSError:
-        print("ERROR:  folder \"" + FOLDER_AND_LOG_NAME + "\" could not be created.")
+        print(f'ERROR:  folder "{FOLDER_AND_LOG_NAME}" could not be created.')
         sys.exit()
 
     return [res, max_forum_pgs_to_process]
@@ -71,9 +246,9 @@ def prompt_user_for_which_forum():
     print("************************")
     while True:
         print("\nSelect which forum to search for GIFs in:")
-        print("Westlake Center:                     enter a \"1\".")
-        print("Wrenches Gears Lawns and Routes:     enter a \"2\".")
-        print("Point83 Navy:                        enter a \"3\".")
+        print('Westlake Center:                     enter a "1".')
+        print('Wrenches Gears Lawns and Routes:     enter a "2".')
+        print('Point83 Navy:                        enter a "3".')
         user_input = input("Enter 1, 2, or 3:\n")
 
         if user_input == "1":
@@ -83,7 +258,7 @@ def prompt_user_for_which_forum():
         elif user_input == "3":
             return "http://www.point83.com/forum/viewforum.php?f=10"
         else:
-            print("ERROR: Invalid entry.")
+            print("ERROR:  Invalid entry.")
 
 
 def prompt_user_for_total_pages():
@@ -97,12 +272,14 @@ def prompt_user_for_total_pages():
             val = int(user_input)
             return val
         except:
-            print("ERROR: Invalid; enter an integer.")
+            print("ERROR:  Invalid; enter an integer.")
 
 
 def prompt_user_for_start_page():
     while True:
-        print("\nIf you want to start on an older page of this forum, enter its page number.")
+        print(
+            "\nIf you want to start on an older page of this forum, enter its page number."
+        )
         print("Otherwise, hit [Enter] for the default, page 1.")
         user_input = input("")
         if user_input == "":
@@ -111,149 +288,7 @@ def prompt_user_for_start_page():
             val = int(user_input)
             return val
         except:
-            print("ERROR: Invalid; enter an integer.")
-
-
-def process_forum(resp, max_forum_pgs_to_process):
-
-    global FORUM_PAGE_NUM  # TEMP
-    page_num = 1  # TEMP
-
-    forum_next_button = True
-    while forum_next_button:
-        soup = bs4.BeautifulSoup(resp.text, "html.parser")
-        viewtopic_anchors = soup.find_all('span', class_="blacklink")
-        forum_next_btn_anchors = soup.find_all('a', href=True, text='Next')
-
-        write_to_log_and_or_console("------------------------" + "\n" + "FORUM PAGE " +
-                                    str(FORUM_PAGE_NUM))
-        write_to_log_and_or_console("------------------------" + "\n")
-
-        all_uris = []               # "viewtopic" part of URL of thread
-        all_thread_names = []       # actual thread names
-        for anchor in viewtopic_anchors:
-            if str(anchor).find("viewtopic.php?t") != -1:
-                all_uris.append(str(anchor)[str(anchor).find("viewtopic"):str(anchor).find("&")])
-                all_thread_names.append(anchor.text)
-
-        for i in range(len(all_uris)):
-            process_thread(all_uris[i], all_thread_names[i])
-
-        # go to next page (IF there is one)
-        if len(forum_next_btn_anchors) > 0:
-            url = "http://www.point83.com/forum/" + forum_next_btn_anchors[0].get("href")
-            try:
-                resp = requests.get(url)
-                resp.raise_for_status()
-            except requests.exceptions.RequestException:
-                write_to_log_and_or_console("\n\nERROR:  URL for forum page number " +
-                                            str(FORUM_PAGE_NUM + 1) + " (" + url +
-                                            ") could not be located.")
-                write_to_log_and_or_console("Exiting process.\n\n")
-                return
-            page_num += 1
-            FORUM_PAGE_NUM += 1
-        else:
-            forum_next_button = False
-
-        if page_num > max_forum_pgs_to_process:
-            forum_next_button = False
-
-
-def process_thread(uri, thread_name):
-    global TOTAL_THREAD_PAGES_SCRAPED
-    # remove all non-ascii characters:
-    thread_name_for_log = re.sub(r'[^\x00-\x7f]', r"", thread_name).strip()
-
-    # remove characters which aren't alpha/num/dot/underscore
-    thread_name_for_file_names = re.sub("[^0-9a-zA-Z._]", "", thread_name).strip()
-
-    thread_page_num = 0
-    thread_next_button = True
-    while thread_next_button:
-        url = "http://www.point83.com/forum/" + uri
-        try:
-            res = requests.get(url)
-            res.raise_for_status()
-        except requests.exceptions.RequestException:
-            write_to_log_and_or_console("ERROR:  URL for thread \"" + thread_name_for_log +
-                                        "\"\n(" + url + ") could not be located.")
-            write_to_log_and_or_console("Moving to next thread.\n")
-            return
-        soup = bs4.BeautifulSoup(res.text, "html.parser")
-        thread_next_btn_anchors = soup.find_all('a', href=True, text='Next')
-
-        if len(thread_next_btn_anchors) > 0 or thread_page_num > 0:
-            # (if it's a MULTI-page thread ... note, second part of the above if
-            #  statement is needed for the *last* page of the multi-page thread)
-            thread_page_num += 1
-            write_to_log_and_or_console("Searching for GIFs in \"" + thread_name_for_log +
-                                        "\" PAGE " + str(thread_page_num) + " .......")
-            final_thread_name = thread_name_for_file_names + "_PG" + str(thread_page_num)
-            # (if it's the LAST page of multi-pg thread)
-            if len(thread_next_btn_anchors) == 0:
-                thread_next_button = False
-        else:
-            # (if it's a SINGLE-page thread)
-            write_to_log_and_or_console("Searching for GIFs in \"" + thread_name_for_log +
-                                        "\" .......")
-            final_thread_name = thread_name_for_file_names
-            thread_next_button = False
-
-        # download all GIFs for this page
-        process_gifs(soup, final_thread_name)
-
-        TOTAL_THREAD_PAGES_SCRAPED += 1
-
-        # if there are "Next" buttons, go to next page in thread
-        if len(thread_next_btn_anchors) > 0:
-            uri = thread_next_btn_anchors[0].get("href")
-
-
-def process_gifs(page_soup, thread_name_for_file_names):
-    global TOTAL_GIFS_DOWNLOADED
-    gifs = page_soup.find_all("img", src=re.compile(r'\.gif$'))
-    count = 0
-    failed_downloads = []
-
-    for gif in gifs:
-        if str(gif).find("src=\"http") != -1:
-            try:
-                img_file = gif.get("src")
-                file_rsrc = requests.get(img_file)
-                file_rsrc.raise_for_status()
-            except requests.exceptions.RequestException:
-                if gif.get("src") not in failed_downloads:
-                    write_to_log_and_or_console("ERROR: " + gif.get("src") +
-                                                " had a problem downloading!")
-                failed_downloads.append(str(gif.get("src")))
-                # (w/o that "if" ^^ and the failed_downloads list:  was writing to log
-                # multiple times for a given failed GIF on a given page)
-                continue
-
-            # remove protocol, then check to see if it's already in list
-            # of used paths (ignore if it is), then also remove slashes
-            img_file = img_file.replace("http://", "")
-            img_file = img_file.replace("https://", "")
-            # if GIF isn't already in the list of all saved GIFs.....
-            if img_file not in ALL_SAVED_GIF_PATHS:
-                # The above if-test was originally before the try statement, but that led to
-                # situations where the only remaining gif on page was a previously used one, and
-                # log file said "Maximum (X) GIFs already downloaded, (etc) ", where it shouldn't
-                # have even considered that gif in the first place.
-                # Moving it here did make script take a tad longer to run though
-                if count > MAX_GIFS_PER_FORUM_PAGE - 1:
-                    write_to_log_and_or_console("\tMaximum (" + str(MAX_GIFS_PER_FORUM_PAGE) +
-                                                ") GIFs already downloaded for this page; "
-                                                "moving to next page or thread...")
-                    break
-                img_file_name = img_file
-                if save_file(thread_name_for_file_names, img_file_name, file_rsrc):
-                    ALL_SAVED_GIF_PATHS.append(img_file)
-                    count += 1
-                    TOTAL_GIFS_DOWNLOADED += 1
-
-    write_to_log_and_or_console("\t" + str(count) + " GIFs downloaded\n")
+            print("ERROR:  Invalid; enter an integer.")
 
 
 def save_file(thread_name_for_file_names, img_file_name, res):
@@ -266,7 +301,7 @@ def save_file(thread_name_for_file_names, img_file_name, res):
     # to 130 just to be sure.
     if len(img_file_name) > 130:
         img_file_name = img_file_name.replace(img_file_name[120:], "_(...).gif")
-    write_to_log_and_or_console("Downloading file: " + img_file_name)
+    write_to_log_and_or_console(f"Downloading file: {img_file_name}")
     try:
         image_file = open(os.path.join(FOLDER_AND_LOG_NAME, img_file_name), "wb")
         for chunk in res.iter_content(100000):
@@ -277,18 +312,20 @@ def save_file(thread_name_for_file_names, img_file_name, res):
         # TODO: figure out how to prevent the file being downloaded in the first place ^^
         if os.path.getsize(os.path.join(FOLDER_AND_LOG_NAME, img_file_name)) == 0:
             os.remove(os.path.join(FOLDER_AND_LOG_NAME, img_file_name))
-            write_to_log_and_or_console("ERROR: GIF downloaded as a 0 KB file. Deleting file.")
+            write_to_log_and_or_console(
+                "ERROR:  GIF downloaded as a 0 KB file. Deleting file."
+            )
             return False
         else:
             ALL_FILE_NAMES_SAVED.append(img_file_name)
             return True
     except:
-        write_to_log_and_or_console("ERROR: " + img_file_name + " had a problem saving!")
+        write_to_log_and_or_console(f"ERROR:  {img_file_name} had a problem saving!")
 
 
 def write_summary():
     write_to_log_and_or_console("---------------------------------")
-    write_to_log_and_or_console("All GIF origin \"paths\" (sorted): ")
+    write_to_log_and_or_console('All GIF origin "paths" (sorted): ')
     write_to_log_and_or_console("---------------------------------")
     for path in sorted(ALL_SAVED_GIF_PATHS):
         write_to_log_and_or_console(path)
@@ -299,24 +336,33 @@ def write_summary():
     for name in sorted(ALL_FILE_NAMES_SAVED):
         write_to_log_and_or_console(name)
 
-    write_to_log_and_or_console("\nTotal items in ALL_SAVED_GIF_PATHS list....." +
-                                str(len(ALL_SAVED_GIF_PATHS)))
-    write_to_log_and_or_console("Total GIFs downloaded....." +
-                                str(TOTAL_GIFS_DOWNLOADED))
-    write_to_log_and_or_console("Total thread-pages scraped....." +
-                                str(TOTAL_THREAD_PAGES_SCRAPED))
+    write_to_log_and_or_console(
+        f"\nTotal items in ALL_SAVED_GIF_PATHS list....."
+        f"{str(len(ALL_SAVED_GIF_PATHS))}"
+    )
+    write_to_log_and_or_console(
+        f"Total GIFs downloaded....." f"{str(TOTAL_GIFS_DOWNLOADED)}"
+    )
+    write_to_log_and_or_console(
+        f"Total thread-pages scraped....." f"{str(TOTAL_THREAD_PGS_SCRAPED)}"
+    )
 
-    write_to_log_and_or_console("\nTotal time for script to run, in H:M:S....." +
-                                str(datetime.now() - START_TIME))
+    write_to_log_and_or_console(
+        f"\nTotal time for script to run, in H:M:S....."
+        f"{str(datetime.now() - START_TIME)}"
+    )
 
 
 def write_to_log_and_or_console(text):
-    with open(FOLDER_AND_LOG_NAME + ".txt", "a") as text_file:
+    with open(
+        os.path.join(FOLDER_AND_LOG_NAME, (FOLDER_AND_LOG_NAME + ".txt")), "a"
+    ) as text_file:
         text_file.write(text + "\n")
     print(text)
 
 
 if __name__ == "__main__":
-    INIT_SETUP_RESULT = initial_setup()
-    process_forum(INIT_SETUP_RESULT[0], INIT_SETUP_RESULT[1])
+    resp, max_forum_pgs_to_process = initial_setup()
+    forum = Forum(resp, max_forum_pgs_to_process)
+    forum.process_forum()
     write_summary()
