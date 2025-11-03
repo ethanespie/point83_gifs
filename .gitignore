@@ -1,0 +1,95 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-wheel-metadata/
+wheels/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+.venv
+venv.bak/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Pyre / MyPy / Lint caches
+.mypy_cache/
+.pyre/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite3
+
+# Backup files
+*.bak
+*.swp
+*~
+
+# Jupyter
+.ipynb_checkpoints
+
+# Node/npm
+node_modules/
+
+# Build artifacts
+dist/
+build/
+
+# Project-specific: ignore script output folders and logs created by the scraper
+Point83GIFs_*
+Point83GIFs_*.txt
+
+# Local environment variables file
+.env
+
+# Notes doc and other random stuff to ignore
+ignore/

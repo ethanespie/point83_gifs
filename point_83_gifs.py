@@ -1,3 +1,16 @@
+"""point_83_gifs.py
+
+Simple scraper to find and download GIFs from point83.com forum threads.
+
+Usage:
+- Run the script and follow prompts to pick a forum, start page, and page count.
+- GIFs and a log file are written to a timestamped folder.
+
+This module defines:
+- Scraper: holds run-time configuration and mutable state.
+- Forum/Thread/Page: crawler classes that use a Scraper instance for shared state.
+"""
+
 import os
 import sys
 import re
@@ -6,46 +19,276 @@ import requests
 import bs4
 
 
-START_TIME = datetime.now()
-FOLDER_AND_LOG_NAME = f"Point83GIFs_{START_TIME.strftime('%Y%m%d_%H%M')}"
+class Scraper:
+    """Orchestrates scraping: configuration, persistent state, logging, and I/O.
 
-MAX_GIFS_PER_FORUM_PAGE = (
-    100  # max gifs per page; sometimes kept low just for debugging purposes
-)
+    Attributes:
+        start_time (datetime): time when the scraper was instantiated.
+        folder_and_log_name (str): directory name for saved GIFs and log.
+        max_gifs_per_forum_page (int): per-page download cap.
+        forum_page_num (int): current forum page number (mutable).
+        all_saved_gif_paths (list): unique GIF source paths downloaded.
+        all_file_names_saved (list): filenames saved on disk.
+        total_gifs_downloaded (int): counter of successful downloads.
+        total_thread_pgs_scraped (int): counter of processed thread pages.
+    """
 
-FORUM_PAGE_NUM = 0  # actual forum page number
-ALL_SAVED_GIF_PATHS = []  # paths to GIFs downloaded, with "http" or "https" removed
-ALL_FILE_NAMES_SAVED = (
-    []
-)  # names of files saved (start with name of thread where first found)
-TOTAL_GIFS_DOWNLOADED = 0
-TOTAL_THREAD_PGS_SCRAPED = 0
+    def __init__(self, max_gifs_per_forum_page=100):
+        self.start_time = datetime.now()
+        self.folder_and_log_name = (
+            f"Point83GIFs_{self.start_time.strftime('%Y%m%d_%H%M')}"
+        )
+        self.max_gifs_per_forum_page = max_gifs_per_forum_page
+
+        # mutable state previously implemented as globals
+        self.forum_page_num = 0
+        self.all_saved_gif_paths = []
+        self.all_file_names_saved = []
+        self.total_gifs_downloaded = 0
+        self.total_thread_pgs_scraped = 0
+
+    # initial setup (was function)
+    def initial_setup(self):
+        """Perform initial prompts, validate the starting URL, and create output folder.
+
+        Returns:
+            tuple: (requests.Response, int) initial HTTP response and max forum pages to process.
+
+        Exits the program on fatal errors (invalid start URL or folder creation failure).
+        """
+        initial_url = self.prompt_user_for_which_forum()
+        start_page_num = self.prompt_user_for_start_page()
+        self.forum_page_num = start_page_num
+        max_forum_pgs_to_process = self.prompt_user_for_total_pages()
+
+        if start_page_num != 1:
+            index = (start_page_num - 1) * 30
+            initial_url = initial_url + "&topicdays=0&start=" + str(index)
+
+        try:
+            res = requests.get(initial_url)
+            res.raise_for_status()
+        except requests.exceptions.RequestException as exception:
+            print(f'ERROR:  URL "{initial_url}" could not be located.\n')
+            print(exception)
+            sys.exit()
+
+        try:
+            os.makedirs(self.folder_and_log_name, exist_ok=True)
+        except OSError:
+            print(f'ERROR:  folder "{self.folder_and_log_name}" could not be created.')
+            sys.exit()
+
+        return res, max_forum_pgs_to_process
+
+    # prompt helpers (moved into class)
+    def prompt_user_for_which_forum(self):
+        """Prompt the user to select which forum to search.
+
+        Returns:
+            str: base URL for the selected forum.
+        """
+        print("************************")
+        print("***** Point83 GIFs *****")
+        print("************************")
+        while True:
+            print("\nSelect which forum to search for GIFs in:")
+            print('Westlake Center:                     enter a "1".')
+            print('Wrenches Gears Lawns and Routes:     enter a "2".')
+            print('Point83 Navy:                        enter a "3".')
+            user_input = input("Enter 1, 2, or 3:\n")
+
+            if user_input == "1":
+                return "http://www.point83.com/forum/viewforum.php?f=2"
+            elif user_input == "2":
+                return "http://www.point83.com/forum/viewforum.php?f=4"
+            elif user_input == "3":
+                return "http://www.point83.com/forum/viewforum.php?f=10"
+            else:
+                print("ERROR:  Invalid entry.")
+
+    def prompt_user_for_total_pages(self):
+        """Prompt how many forum pages to process.
+
+        Returns:
+            int: number of pages to process (large default for 'all').
+        """
+        while True:
+            print("\nHow many pages of the given forum do you want to process?")
+            print("Hit [Enter] for the default (all pages).")
+            user_input = input("")
+            if user_input == "":
+                return 1000000
+            try:
+                val = int(user_input)
+                return val
+            except ValueError:
+                print("ERROR:  Invalid; enter an integer.")
+
+    def prompt_user_for_start_page(self):
+        """Prompt for start page number (allows resuming at older pages).
+
+        Returns:
+            int: starting forum page (1 by default).
+        """
+        while True:
+            print(
+                "\nIf you want to start on an older page of this forum, enter its page number."
+            )
+            print("Otherwise, hit [Enter] for the default, page 1.")
+            user_input = input("")
+            if user_input == "":
+                return 1
+            try:
+                val = int(user_input)
+                return val
+            except ValueError:
+                print("ERROR:  Invalid; enter an integer.")
+
+    # save_file now references instance attributes instead of globals
+    def save_file(self, thread_name_for_file_names, img_file_name, res):
+        """Save a downloaded GIF stream to disk.
+
+        Parameters:
+            thread_name_for_file_names (str): sanitized thread identifier used as filename prefix.
+            img_file_name (str): original GIF path (sanitized before saving).
+            res (requests.Response): response object containing GIF content.
+
+        Returns:
+            bool: True when save succeeded, False otherwise.
+        """
+        img_file_name = re.sub("[^0-9a-zA-Z._]", "-", img_file_name)
+        img_file_name = thread_name_for_file_names + "__" + img_file_name
+
+        if len(img_file_name) > 130:
+            img_file_name = img_file_name.replace(img_file_name[120:], "_(...).gif")
+        self.write_to_log_and_or_console(f"Downloading file: {img_file_name}")
+        try:
+            dest = os.path.join(self.folder_and_log_name, img_file_name)
+            with open(dest, "wb") as image_file:
+                for chunk in res.iter_content(100000):
+                    image_file.write(chunk)
+
+            try:
+                size = os.path.getsize(dest)
+            except OSError as e:
+                # couldn't stat file
+                self.write_to_log_and_or_console(
+                    f"ERROR: cannot determine size of '{dest}': {e}"
+                )
+                return False
+
+            if size == 0:
+                try:
+                    os.remove(dest)
+                except OSError as e:
+                    self.write_to_log_and_or_console(
+                        f"WARNING: failed to remove zero-byte file '{dest}': {e}"
+                    )
+                self.write_to_log_and_or_console(
+                    "ERROR:  GIF downloaded as a 0 KB file. Deleting file."
+                )
+                return False
+            else:
+                self.all_file_names_saved.append(img_file_name)
+                return True
+        except (OSError, IOError) as e:
+            self.write_to_log_and_or_console(
+                f"ERROR:  {img_file_name} had a problem saving: {e}"
+            )
+            return False
+
+    # logging helper
+    def write_to_log_and_or_console(self, text):
+        """Append a line to the log file and also print it to stdout.
+
+        The method falls back to console output when writing the log file fails.
+        """
+        log_path = os.path.join(
+            self.folder_and_log_name, (self.folder_and_log_name + ".txt")
+        )
+        try:
+            with open(log_path, "a", encoding="utf-8") as text_file:
+                text_file.write(text + "\n")
+        except (OSError, IOError) as e:
+            # fallback: print to console with a note that file write failed
+            print(f"(LOG WRITE FAILED: {e})")
+            # still print the message so the user sees it
+            print(text)
+            return
+        print(text)
+
+    # write summary
+    def write_summary(self):
+        """Write a summary of all downloaded GIFs and script statistics to the log and console."""
+        self.write_to_log_and_or_console("---------------------------------")
+        self.write_to_log_and_or_console('All GIF origin "paths" (sorted): ')
+        self.write_to_log_and_or_console("---------------------------------")
+        for path in sorted(self.all_saved_gif_paths):
+            self.write_to_log_and_or_console(path)
+
+        self.write_to_log_and_or_console("\n--------------------------")
+        self.write_to_log_and_or_console("All files saved (sorted): ")
+        self.write_to_log_and_or_console("--------------------------")
+        for name in sorted(self.all_file_names_saved):
+            self.write_to_log_and_or_console(name)
+
+        self.write_to_log_and_or_console(
+            f"\nTotal items in ALL_SAVED_GIF_PATHS list....."
+            f"{str(len(self.all_saved_gif_paths))}"
+        )
+        self.write_to_log_and_or_console(
+            f"Total GIFs downloaded....." f"{str(self.total_gifs_downloaded)}"
+        )
+        self.write_to_log_and_or_console(
+            f"Total thread-pages scraped....." f"{str(self.total_thread_pgs_scraped)}"
+        )
+
+        self.write_to_log_and_or_console(
+            f"\nTotal time for script to run, in H:M:S....."
+            f"{str(datetime.now() - self.start_time)}"
+        )
+
+    # main runner
+    def run(self):
+        """Execute the full scraping run: setup, process forum pages, and write summary."""
+        res, max_forum_pgs_to_process = self.initial_setup()
+        forum = Forum(res, max_forum_pgs_to_process, self)
+        forum.process_forum()
+        self.write_summary()
 
 
 class Forum:
-    def __init__(self, resp, max_forum_pgs_to_process) -> None:
+    """Represents a forum index page and iterates threads within it.
+
+    The Forum instance does not hold global state itself; it references a Scraper
+    instance for shared configuration and counters.
+    """
+
+    def __init__(self, resp, max_forum_pgs_to_process, scraper: Scraper) -> None:
         self.resp = resp
         self.max_forum_pgs_to_process = max_forum_pgs_to_process
+        self.scraper = scraper
 
     def process_forum(self):
-
-        global FORUM_PAGE_NUM  # TEMP
-        page_num = 1  # TEMP
+        """Process the current forum page: find thread URIs, instantiate Thread objects,
+        and follow 'Next' links until the configured page limit is reached.
+        """
+        page_num = 1
 
         forum_next_button = True
         while forum_next_button:
             soup = bs4.BeautifulSoup(self.resp.text, "html.parser")
             viewtopic_anchors = soup.find_all("span", class_="blacklink")
-            # forum_next_btn_anchors = soup.find_all("a", href=True, text="Next")
             forum_next_btn_anchors = soup.find_all("a", href=True, string="Next")
 
-            write_to_log_and_or_console(
-                f"------------------------\nFORUM PAGE {str(FORUM_PAGE_NUM)}"
+            self.scraper.write_to_log_and_or_console(
+                f"------------------------\nFORUM PAGE {str(self.scraper.forum_page_num)}"
             )
-            write_to_log_and_or_console("------------------------\n")
+            self.scraper.write_to_log_and_or_console("------------------------\n")
 
-            all_uris = []  # "viewtopic" part of URL of thread
-            all_thread_names = []  # actual thread names
+            all_uris = []
+            all_thread_names = []
             for anchor in viewtopic_anchors:
                 if str(anchor).find("viewtopic.php?t") != -1:
                     all_uris.append(
@@ -56,7 +299,7 @@ class Forum:
                     all_thread_names.append(anchor.text)
 
             for i in range(len(all_uris)):
-                thread = Thread(all_uris[i], all_thread_names[i])
+                thread = Thread(all_uris[i], all_thread_names[i], self.scraper)
                 thread.process_thread()
 
             # go to next page (IF there is one)
@@ -66,15 +309,15 @@ class Forum:
                     self.resp = requests.get(url)
                     self.resp.raise_for_status()
                 except requests.exceptions.RequestException:
-                    write_to_log_and_or_console(
+                    self.scraper.write_to_log_and_or_console(
                         f"\n\nERROR:  URL for forum page number "
-                        f"{str(FORUM_PAGE_NUM + 1)} ({url}) "
+                        f"{str(self.scraper.forum_page_num + 1)} ({url}) "
                         f"could not be located."
                     )
-                    write_to_log_and_or_console("Exiting process.\n\n")
+                    self.scraper.write_to_log_and_or_console("Exiting process.\n\n")
                     return
                 page_num += 1
-                FORUM_PAGE_NUM += 1
+                self.scraper.forum_page_num += 1
             else:
                 forum_next_button = False
 
@@ -83,17 +326,21 @@ class Forum:
 
 
 class Thread:
+    """Represents a forum thread and iterates its pages to find GIFs.
 
-    def __init__(self, uri, thread_name):
+    It uses the Scraper instance for logging and to record downloaded items.
+    """
+
+    def __init__(self, uri, thread_name, scraper: Scraper):
         self.uri = uri
         self.thread_name = thread_name
+        self.scraper = scraper
 
     def process_thread(self):
-        global TOTAL_THREAD_PGS_SCRAPED
+        """Visit each page in the thread (follows 'Next') and spawn Page objects to download GIFs."""
         # remove all non-ascii characters:
         thread_name_for_log = re.sub(r"[^\x00-\x7f]", r"", self.thread_name).strip()
 
-        # remove characters which aren't alpha/num/dot/underscore
         thread_name_for_file_names = re.sub(
             "[^0-9a-zA-Z._]", "", self.thread_name
         ).strip()
@@ -106,21 +353,20 @@ class Thread:
                 res = requests.get(url)
                 res.raise_for_status()
             except requests.exceptions.RequestException:
-                write_to_log_and_or_console(
+                self.scraper.write_to_log_and_or_console(
                     f'ERROR:  URL for thread "{thread_name_for_log}'
                     f'"\n({url}) could not be located.'
                 )
-                write_to_log_and_or_console("Moving to next thread.\n")
+                self.scraper.write_to_log_and_or_console("Moving to next thread.\n")
                 return
             soup = bs4.BeautifulSoup(res.text, "html.parser")
-            # thread_next_btn_anchors = soup.find_all("a", href=True, text="Next")
             thread_next_btn_anchors = soup.find_all("a", href=True, string="Next")
 
             if len(thread_next_btn_anchors) > 0 or thread_page_num > 0:
                 # (if it's a MULTI-page thread ... note, second part of the above if
                 #  statement is needed for the *last* page of the multi-page thread)
                 thread_page_num += 1
-                write_to_log_and_or_console(
+                self.scraper.write_to_log_and_or_console(
                     f'Searching for GIFs in "{thread_name_for_log}'
                     f'" PAGE {str(thread_page_num)} .......'
                 )
@@ -132,17 +378,17 @@ class Thread:
                     thread_next_button = False
             else:
                 # (if it's a SINGLE-page thread)
-                write_to_log_and_or_console(
+                self.scraper.write_to_log_and_or_console(
                     f'Searching for GIFs in "{thread_name_for_log}' f'" .......'
                 )
                 final_thread_name = thread_name_for_file_names
                 thread_next_button = False
 
             # download all GIFs for this page
-            page = Page(soup, final_thread_name)
+            page = Page(soup, final_thread_name, self.scraper)
             page.process_page()
 
-            TOTAL_THREAD_PGS_SCRAPED += 1
+            self.scraper.total_thread_pgs_scraped += 1
 
             # if there are "Next" buttons, go to next page in thread
             if len(thread_next_btn_anchors) > 0:
@@ -150,14 +396,17 @@ class Thread:
 
 
 class Page:
-    def __init__(self, soup, thread_name_for_file_names):
+    """Processes a single thread page: finds GIF image tags and downloads unique GIFs."""
+
+    def __init__(self, soup, thread_name_for_file_names, scraper: Scraper):
         self.soup = soup
         self.thread_name_for_file_names = thread_name_for_file_names
         self.gifs_downloaded = 0
         self.failed_downloads = []
+        self.scraper = scraper
 
     def process_page(self):
-        global TOTAL_GIFS_DOWNLOADED
+        """Find GIF <img> elements on the provided BeautifulSoup page and attempt downloads."""
         gifs = self.soup.find_all("img", src=re.compile(r"\.gif$"))
 
         for gif in gifs:
@@ -165,204 +414,50 @@ class Page:
                 if not self._download_gif(gif):
                     continue
 
-        write_to_log_and_or_console(f"\t{str(self.gifs_downloaded)} GIFs downloaded\n")
+        self.scraper.write_to_log_and_or_console(
+            f"\t{str(self.gifs_downloaded)} GIFs downloaded\n"
+        )
 
     def _download_gif(self, gif):
-        global TOTAL_GIFS_DOWNLOADED
+        """Download a single GIF given an <img> tag and save it via the Scraper.
 
+        Returns:
+            bool: True if the GIF was downloaded and recorded, False otherwise.
+        """
         try:
             img_file = gif.get("src")
             file_rsrc = requests.get(img_file)
             file_rsrc.raise_for_status()
         except requests.exceptions.RequestException:
             if gif.get("src") not in self.failed_downloads:
-                write_to_log_and_or_console(
+                self.scraper.write_to_log_and_or_console(
                     f"ERROR:  {gif.get('src')} had a problem downloading!"
                 )
             self.failed_downloads.append(str(gif.get("src")))
-            # (w/o that "if" ^^ and the failed_downloads list:  was writing to log
-            # multiple times for a given failed GIF on a given page)
             return False
 
-        # (w/o that "if" ^^ and the failed_downloads list:  was writing to log
-        # multiple times for a given failed GIF on a given page)
-        img_file = img_file.replace("http://", "")
-        img_file = img_file.replace("https://", "")
-        # if GIF isn't already in the list of all saved GIFs.....
-        if img_file not in ALL_SAVED_GIF_PATHS:
-            if self.gifs_downloaded > MAX_GIFS_PER_FORUM_PAGE - 1:
-                write_to_log_and_or_console(
-                    f"\tMaximum ({str(MAX_GIFS_PER_FORUM_PAGE)}) GIFs "
+        img_file = img_file.replace("http://", "").replace("https://", "")
+        if img_file not in self.scraper.all_saved_gif_paths:
+            if self.gifs_downloaded > self.scraper.max_gifs_per_forum_page - 1:
+                self.scraper.write_to_log_and_or_console(
+                    f"\tMaximum ({str(self.scraper.max_gifs_per_forum_page)}) GIFs "
                     f"already downloaded for this page; moving to next "
                     f"page or thread..."
                 )
                 return False
 
             img_file_name = img_file
-            if save_file(self.thread_name_for_file_names, img_file_name, file_rsrc):
-                ALL_SAVED_GIF_PATHS.append(img_file)
+            if self.scraper.save_file(
+                self.thread_name_for_file_names, img_file_name, file_rsrc
+            ):
+                self.scraper.all_saved_gif_paths.append(img_file)
                 self.gifs_downloaded += 1
-                TOTAL_GIFS_DOWNLOADED += 1
+                self.scraper.total_gifs_downloaded += 1
                 return True
 
         return False
 
 
-def initial_setup():
-    global FOLDER_AND_LOG_NAME, FORUM_PAGE_NUM
-
-    initial_url = prompt_user_for_which_forum()
-    start_page_num = prompt_user_for_start_page()
-    FORUM_PAGE_NUM = start_page_num
-    max_forum_pgs_to_process = prompt_user_for_total_pages()
-
-    if start_page_num != 1:
-        index = (start_page_num - 1) * 30
-        initial_url = initial_url + "&topicdays=0&start=" + str(index)
-
-    try:
-        res = requests.get(
-            initial_url
-        )  # "downloads" the web page; returns a response object
-        res.raise_for_status()  # checks to see if download worked; raises exception if fail
-    except requests.exceptions.RequestException as exception:
-        print(f'ERROR:  URL "{initial_url}" could not be located.\n')
-        print(exception)
-        sys.exit()
-
-    # Make folder to store downloaded GIFs in
-    try:
-        os.makedirs(FOLDER_AND_LOG_NAME, exist_ok=True)
-    except OSError:
-        print(f'ERROR:  folder "{FOLDER_AND_LOG_NAME}" could not be created.')
-        sys.exit()
-
-    return [res, max_forum_pgs_to_process]
-
-
-def prompt_user_for_which_forum():
-    print("************************")
-    print("***** Point83 GIFs *****")
-    print("************************")
-    while True:
-        print("\nSelect which forum to search for GIFs in:")
-        print('Westlake Center:                     enter a "1".')
-        print('Wrenches Gears Lawns and Routes:     enter a "2".')
-        print('Point83 Navy:                        enter a "3".')
-        user_input = input("Enter 1, 2, or 3:\n")
-
-        if user_input == "1":
-            return "http://www.point83.com/forum/viewforum.php?f=2"
-        elif user_input == "2":
-            return "http://www.point83.com/forum/viewforum.php?f=4"
-        elif user_input == "3":
-            return "http://www.point83.com/forum/viewforum.php?f=10"
-        else:
-            print("ERROR:  Invalid entry.")
-
-
-def prompt_user_for_total_pages():
-    while True:
-        print("\nHow many pages of the given forum do you want to process?")
-        print("Hit [Enter] for the default (all pages).")
-        user_input = input("")
-        if user_input == "":
-            return 1000000
-        try:
-            val = int(user_input)
-            return val
-        except:
-            print("ERROR:  Invalid; enter an integer.")
-
-
-def prompt_user_for_start_page():
-    while True:
-        print(
-            "\nIf you want to start on an older page of this forum, enter its page number."
-        )
-        print("Otherwise, hit [Enter] for the default, page 1.")
-        user_input = input("")
-        if user_input == "":
-            return 1
-        try:
-            val = int(user_input)
-            return val
-        except:
-            print("ERROR:  Invalid; enter an integer.")
-
-
-def save_file(thread_name_for_file_names, img_file_name, res):
-    # replace characters which aren't alpha/num/dot/underscore with hyphen
-    img_file_name = re.sub("[^0-9a-zA-Z._]", "-", img_file_name)
-    img_file_name = thread_name_for_file_names + "__" + img_file_name
-
-    # Seems that when path + file name (including "C:\") is > 259 characters, produces error
-    # For almost all files tried so far, img_file_name was well under 150, but we'll limit it
-    # to 130 just to be sure.
-    if len(img_file_name) > 130:
-        img_file_name = img_file_name.replace(img_file_name[120:], "_(...).gif")
-    write_to_log_and_or_console(f"Downloading file: {img_file_name}")
-    try:
-        image_file = open(os.path.join(FOLDER_AND_LOG_NAME, img_file_name), "wb")
-        for chunk in res.iter_content(100000):
-            image_file.write(chunk)
-        image_file.close()
-
-        # Delete 0 KB sized filed (before, broken links sometimes caused 0 KB files to be downld)
-        # TODO: figure out how to prevent the file being downloaded in the first place ^^
-        if os.path.getsize(os.path.join(FOLDER_AND_LOG_NAME, img_file_name)) == 0:
-            os.remove(os.path.join(FOLDER_AND_LOG_NAME, img_file_name))
-            write_to_log_and_or_console(
-                "ERROR:  GIF downloaded as a 0 KB file. Deleting file."
-            )
-            return False
-        else:
-            ALL_FILE_NAMES_SAVED.append(img_file_name)
-            return True
-    except:
-        write_to_log_and_or_console(f"ERROR:  {img_file_name} had a problem saving!")
-
-
-def write_summary():
-    write_to_log_and_or_console("---------------------------------")
-    write_to_log_and_or_console('All GIF origin "paths" (sorted): ')
-    write_to_log_and_or_console("---------------------------------")
-    for path in sorted(ALL_SAVED_GIF_PATHS):
-        write_to_log_and_or_console(path)
-
-    write_to_log_and_or_console("\n--------------------------")
-    write_to_log_and_or_console("All files saved (sorted): ")
-    write_to_log_and_or_console("--------------------------")
-    for name in sorted(ALL_FILE_NAMES_SAVED):
-        write_to_log_and_or_console(name)
-
-    write_to_log_and_or_console(
-        f"\nTotal items in ALL_SAVED_GIF_PATHS list....."
-        f"{str(len(ALL_SAVED_GIF_PATHS))}"
-    )
-    write_to_log_and_or_console(
-        f"Total GIFs downloaded....." f"{str(TOTAL_GIFS_DOWNLOADED)}"
-    )
-    write_to_log_and_or_console(
-        f"Total thread-pages scraped....." f"{str(TOTAL_THREAD_PGS_SCRAPED)}"
-    )
-
-    write_to_log_and_or_console(
-        f"\nTotal time for script to run, in H:M:S....."
-        f"{str(datetime.now() - START_TIME)}"
-    )
-
-
-def write_to_log_and_or_console(text):
-    with open(
-        os.path.join(FOLDER_AND_LOG_NAME, (FOLDER_AND_LOG_NAME + ".txt")), "a"
-    ) as text_file:
-        text_file.write(text + "\n")
-    print(text)
-
-
 if __name__ == "__main__":
-    resp, max_forum_pgs_to_process = initial_setup()
-    forum = Forum(resp, max_forum_pgs_to_process)
-    forum.process_forum()
-    write_summary()
+    scraper = Scraper()
+    scraper.run()
